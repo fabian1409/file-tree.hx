@@ -892,3 +892,11 @@
   (when *file-tree-active*
     (file-tree-close!)))
 
+;; keeps git status badges fresh as you save files, the same trigger helix's
+;; own gutter diff indicators already refresh on - no polling, no watching
+(register-hook! 'document-saved
+                (lambda (_)
+                  (when *file-tree-active*
+                    (file-tree-refresh-all!)
+                    (helix.redraw '()))))
+
