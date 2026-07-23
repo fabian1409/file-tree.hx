@@ -668,7 +668,7 @@
         (define git-status (and (not dir?) (file-tree-git-status path)))
         (define git-icon (if git-status (file-tree-git-status-icon git-status) " "))
         (define y (+ list-y0 row))
-        (define hl? (= abs-idx *file-tree-cursor*))
+        (define hl? (and *file-tree-focused* (= abs-idx *file-tree-cursor*)))
         (define row-style (cond [root? root-text-style] [dir? dir-text-style] [else file-text-style]))
         (define icon-style (cond [dir? dir-icon-style] [else file-icon-style]))
         (define git-style
