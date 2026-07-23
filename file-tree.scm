@@ -83,6 +83,38 @@
          (string=? (trim (read-port-to-string (child-stdout (Ok->value proc)))) "true"))))
 
 (define *file-tree-git-status-map* (hash))
+(define *file-tree-dir-status-map* (hash))
+
+;; lower wins when a directory has descendants with different statuses, so
+;; e.g. a dir containing both a modified and an untracked file shows modified
+(define (file-tree-status-priority status)
+  (cond
+    [(equal? status 'modified) 0]
+    [(equal? status 'added) 1]
+    [(equal? status 'deleted) 2]
+    [(equal? status 'renamed) 3]
+    [(equal? status 'untracked) 4]
+    [else 5]))
+
+;; folds each changed file's status into every ancestor directory above it,
+;; so collapsed directories still show that something changed inside them
+(define (file-tree-compute-dir-statuses!)
+  (define acc (hash))
+  (let loop ([ks (hash-keys->list *file-tree-git-status-map*)])
+    (unless (null? ks)
+      (define rel (car ks))
+      (define status (hash-try-get *file-tree-git-status-map* rel))
+      (define parts (split-many rel (path-separator)))
+      (define dir-parts (if (null? parts) '() (reverse (cdr (reverse parts)))))
+      (let dloop ([ps dir-parts] [prefix ""])
+        (unless (null? ps)
+          (define next (if (equal? prefix "") (car ps) (string-append prefix (path-separator) (car ps))))
+          (define existing (hash-try-get acc next))
+          (when (or (not existing) (< (file-tree-status-priority status) (file-tree-status-priority existing)))
+            (set! acc (hash-insert acc next status)))
+          (dloop (cdr ps) next)))
+      (loop (cdr ks))))
+  (set! *file-tree-dir-status-map* acc))
 
 ;; classifies code it modifiles added deleted and renames
 (define (file-tree-git-status-symbol code)
@@ -122,7 +154,8 @@
       (lambda (_) (cons (hashset) (hash)))
       (if (not (file-tree-git-repo? root))
           (cons (hashset) (hash))
-          (let ([proc (~> (command "git" (list "-C" root "status" "--porcelain" "--ignored=matching"))
+          (let ([proc (~> (command "git" (list "-C" root "status" "--porcelain"
+                                                "--untracked-files=all" "--ignored=matching"))
                           with-stdout-piped
                           with-stderr-piped
                           spawn-process)])
@@ -132,7 +165,8 @@
                   (file-tree-parse-git-status-lines lines))
                 (cons (hashset) (hash)))))))
   (set! *file-tree-git-ignored-set* (car parsed))
-  (set! *file-tree-git-status-map* (cdr parsed)))
+  (set! *file-tree-git-status-map* (cdr parsed))
+  (file-tree-compute-dir-statuses!))
 
 (define *file-tree-active* #f)
 (define *file-tree-focused* #f)
@@ -256,6 +290,9 @@
 
 (define (file-tree-git-status path)
   (hash-try-get *file-tree-git-status-map* (file-tree-relpath path)))
+
+(define (file-tree-dir-git-status path)
+  (hash-try-get *file-tree-dir-status-map* (file-tree-relpath path)))
 
 ;; dirs before files, alphabetic oder
 (define (file-tree-sort-entries lst)
@@ -729,7 +766,12 @@
         (define root? (= depth 0))
         (define dir? (is-dir? path))
         (define icon (cond [root? ""] [dir? (file-tree-dir-icon-for path)] [else *file-tree-icon-file*]))
-        (define git-status (and (not dir?) (file-tree-git-status path)))
+        (define git-status
+          (cond [root? #f]
+                ;; only summarize on a dir while it's collapsed - once expanded,
+                ;; the individual file badges underneath already show it
+                [dir? (and (hash-try-get *file-tree-directories* path) (file-tree-dir-git-status path))]
+                [else (file-tree-git-status path)]))
         (define git-icon (if git-status (file-tree-git-status-icon git-status) " "))
         (define y (+ list-y0 row))
         (define hl? (and *file-tree-focused* (= abs-idx *file-tree-cursor*)))
@@ -748,7 +790,7 @@
         (frame-set-string! frame x0 y prefix indent-guide-style)
         (frame-set-string! frame (+ x0 prefix-w) y icon icon-style)
         (frame-set-string! frame name-x y (file-tree-truncate name avail) row-style)
-        (unless dir?
+        (unless root?
           (frame-set-string! frame git-col-x y git-icon git-style))
         (loop (cdr items) (+ row 1))))))
 
