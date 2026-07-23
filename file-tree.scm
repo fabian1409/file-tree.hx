@@ -145,6 +145,8 @@
 (define *file-tree-default-keybinds*
   (hash 'down "j"
         'up "k"
+        'top "g"
+        'bottom "G"
         'create "n"
         'rename "r"
         'delete "d"
@@ -157,14 +159,19 @@
 
 (define *file-tree-keybinds* *file-tree-default-keybinds*)
 
+;; char -> action, kept in sync with *file-tree-keybinds* so a keypress is a
+;; single hash lookup instead of scanning every bound action
+(define (file-tree-invert-keybinds keybinds)
+  (let loop ([ks (hash-keys->list keybinds)] [acc (hash)])
+    (if (null? ks)
+        acc
+        (loop (cdr ks) (hash-insert acc (hash-try-get keybinds (car ks)) (car ks))))))
+
+(define *file-tree-char-actions* (file-tree-invert-keybinds *file-tree-keybinds*))
+
 ;; looks up which action (if any) a keypress is bound to
 (define (file-tree-action-for-char ch)
-  (define s (string ch))
-  (let loop ([ks (hash-keys->list *file-tree-keybinds*)])
-    (cond
-      [(null? ks) #f]
-      [(equal? (hash-try-get *file-tree-keybinds* (car ks)) s) (car ks)]
-      [else (loop (cdr ks))])))
+  (hash-try-get *file-tree-char-actions* (string ch)))
 
 (provide file-tree-open)
 (provide file-tree-close)
@@ -178,7 +185,8 @@
         (let loop ([ks (hash-keys->list overrides)] [acc *file-tree-keybinds*])
           (if (null? ks)
               acc
-              (loop (cdr ks) (hash-insert acc (car ks) (hash-try-get overrides (car ks))))))))
+              (loop (cdr ks) (hash-insert acc (car ks) (hash-try-get overrides (car ks)))))))
+  (set! *file-tree-char-actions* (file-tree-invert-keybinds *file-tree-keybinds*)))
 
 ;; keep the panel off the rows moka's bars uses
 (define *file-tree-reserved-top-fn* 'unresolved)
@@ -197,12 +205,6 @@
   (file-tree-resolve-reserved!)
   (if *file-tree-reserved-bottom-fn* (with-handler (lambda (_) 0) (*file-tree-reserved-bottom-fn*)) 0))
 
-(define (file-tree-take lst n)
-  (if (or (null? lst) (<= n 0)) '() (cons (car lst) (file-tree-take (cdr lst) (- n 1)))))
-
-(define (file-tree-drop lst n)
-  (if (or (null? lst) (<= n 0)) lst (file-tree-drop (cdr lst) (- n 1))))
-
 (define (file-tree-truncate s max-w)
   (if (<= (string-length s) max-w)
       s
@@ -218,6 +220,10 @@
            (equal? (substring path 0 (string-length prefix)) prefix))
       (substring path (string-length prefix) (string-length path))
       path))
+
+;; parent directory of a path, e.g. /a/b/c.txt -> /a/b
+(define (file-tree-parent-dir path)
+  (trim-end-matches path (string-append (path-separator) (file-name path))))
 
 ;; cached lazily, same pattern as *file-tree-reserved-top-fn*
 (define *file-tree-home-dir* 'unresolved)
@@ -348,15 +354,29 @@
     (when (< *file-tree-cursor* *file-tree-window-start*)
       (set! *file-tree-window-start* (- *file-tree-window-start* 1)))))
 
+(define (file-tree-cursor-to-top!)
+  (set! *file-tree-cursor* 0)
+  (set! *file-tree-window-start* 0))
+
+(define (file-tree-cursor-to-bottom!)
+  (define n (file-tree-active-count))
+  (set! *file-tree-cursor* (max 0 (- n 1)))
+  (set! *file-tree-window-start* (max 0 (- n *file-tree-visible-height*))))
+
 (define (file-tree-current-entry)
   (and (not (null? *file-tree-tree*))
        (list-ref *file-tree-tree* *file-tree-cursor*)))
 
-;; refreshes the view after an eaction like deletion
+;; refreshes the view after an eaction like deletion. re-scans git status too,
+;; so newly created/renamed/deleted files and any git state changed outside
+;; the editor (e.g. `git add`, `git commit`) show up immediately instead of
+;; only after closing and reopening the panel
 (define (file-tree-refresh-all!)
   (define old *file-tree-cursor*)
+  (file-tree-scan-git-ignored! (helix-find-workspace))
   (file-tree-build-tree!)
-  (set! *file-tree-cursor* (min old (max 0 (- (file-tree-active-count) 1)))))
+  (set! *file-tree-cursor* (min old (max 0 (- (file-tree-active-count) 1))))
+  (set! *file-tree-window-start* (min *file-tree-window-start* (max 0 (- (file-tree-active-count) 1)))))
 
 (define (file-tree-toggle-hidden!)
   (set! *file-tree-show-hidden* (not *file-tree-show-hidden*))
@@ -373,7 +393,8 @@
         (hash-insert *file-tree-directories* path (not (hash-try-get *file-tree-directories* path))))
   (define old *file-tree-cursor*)
   (file-tree-build-tree!)
-  (set! *file-tree-cursor* (min old (max 0 (- (length *file-tree-tree*) 1)))))
+  (set! *file-tree-cursor* (min old (max 0 (- (length *file-tree-tree*) 1))))
+  (set! *file-tree-window-start* (min *file-tree-window-start* (max 0 (- (length *file-tree-tree*) 1)))))
 
 ;; `:open` (and so `helix.open`) always resets the cursor to line 0 after
 ;; switching, even for an already-open document - it's meant for the
@@ -482,7 +503,8 @@
      (define cb *file-tree-modal-callback*)
      (set! *file-tree-modal-callback* #f)
      (set! *file-tree-modal-open?* #f)
-     (when cb (enqueue-thread-local-callback (lambda () (cb (and (char? ch) (equal? ch #\y))))))
+     (when cb (enqueue-thread-local-callback
+               (lambda () (cb (and (char? ch) (or (equal? ch #\y) (equal? ch #\Y)))))))
      event-result/close]
     [(key-event-enter? event)
      (define result *file-tree-modal-buffer*)
@@ -541,6 +563,25 @@
             (error (trim stderr))))
         (error "mkdir: could not spawn process"))))
 
+;; actually creates the file/dir once we know it's either new or the user
+;; confirmed overwriting whatever is already there
+(define (file-tree-finish-create! full name dir?)
+  (with-handler
+    (lambda (err) (file-tree-error (string-append "create failed: " (error-object-message err))))
+    (begin
+      (if dir?
+          (file-tree-run-mkdir-p! full)
+          (begin
+            ;; nested new files need their parent dir(s) created first - `write`
+            ;; (unlike `write!`) does not create missing intermediate directories
+            (file-tree-run-mkdir-p! (file-tree-parent-dir full))
+            (helix.vsplit-new)
+            (helix.open full)
+            (helix.write full)
+            (helix.quit)))
+      (file-tree-info (string-append "created " name))))
+  (enqueue-thread-local-callback file-tree-refresh-all!))
+
 (define (file-tree-prompt-create!)
   (define entry (file-tree-current-entry))
   (when entry
@@ -556,18 +597,35 @@
         (file-tree-relpath base)
         (lambda (name)
           (define full (string-append (helix-find-workspace) (path-separator) name))
-          (with-handler
-            (lambda (err) (file-tree-error (string-append "create failed: " (error-object-message err))))
-            (begin
-              (if (ends-with? name (path-separator))
-                  (file-tree-run-mkdir-p! full)
-                  (begin
-                    (helix.vsplit-new)
-                    (helix.open full)
-                    (helix.write full)
-                    (helix.quit)))
-              (file-tree-info (string-append "created " name))))
-          (enqueue-thread-local-callback file-tree-refresh-all!)))))))
+          (define dir? (ends-with? name (path-separator)))
+          ;; drop the trailing separator (if any) before checking for a
+          ;; filesystem collision, otherwise is-file?/is-dir? see a malformed path
+          (define probe (trim-end-matches full (path-separator)))
+          (cond
+            ;; mkdir -p on an already-existing dir is a harmless no-op, so this
+            ;; case just needs an accurate message, not an overwrite prompt
+            [(and dir? (is-dir? probe))
+             (file-tree-info (string-append name " already exists"))]
+            ;; anything else that already exists at this path would otherwise
+            ;; get silently truncated/overwritten - confirm first
+            [(or (is-file? probe) (is-dir? probe))
+             (enqueue-thread-local-callback
+              (lambda ()
+                (file-tree-show-modal!
+                 'confirm
+                 (string-append "Overwrite '" name "'? (y/N) ")
+                 ""
+                 (lambda (confirmed?)
+                   (when confirmed? (file-tree-finish-create! full name dir?))))))]
+            [else (file-tree-finish-create! full name dir?)])))))))
+
+(define (file-tree-finish-rename! path new-path name new-name)
+  (with-handler
+    (lambda (err) (file-tree-error (string-append "rename failed: " (error-object-message err))))
+    (begin
+      (file-tree-run-mv! path new-path)
+      (file-tree-info (string-append "renamed " name " -> " new-name))))
+  (enqueue-thread-local-callback file-tree-refresh-all!))
 
 (define (file-tree-prompt-rename!)
   (define entry (file-tree-current-entry))
@@ -583,12 +641,18 @@
         name
         (lambda (new-name)
           (when (and (not (equal? new-name "")) (not (equal? new-name name)))
-            (with-handler
-              (lambda (err) (file-tree-error (string-append "rename failed: " (error-object-message err))))
-              (begin
-                (file-tree-run-mv! path (string-append dir (path-separator) new-name))
-                (file-tree-info (string-append "renamed " name " -> " new-name))))
-            (enqueue-thread-local-callback file-tree-refresh-all!))))))))
+            (define new-path (string-append dir (path-separator) new-name))
+            ;; `mv` overwrites silently, so confirm first if the target already exists
+            (if (or (is-file? new-path) (is-dir? new-path))
+                (enqueue-thread-local-callback
+                 (lambda ()
+                   (file-tree-show-modal!
+                    'confirm
+                    (string-append "Overwrite '" new-name "'? (y/N) ")
+                    ""
+                    (lambda (confirmed?)
+                      (when confirmed? (file-tree-finish-rename! path new-path name new-name))))))
+                (file-tree-finish-rename! path new-path name new-name)))))))))
 
 (define (file-tree-prompt-delete!)
   (define entry (file-tree-current-entry))
@@ -652,8 +716,8 @@
   (define list-y0 y0)
   (define max-text-w (- w 2))
 
-  (let ([visible (file-tree-take (file-tree-drop *file-tree-tree* *file-tree-window-start*)
-                               *file-tree-visible-height*)])
+  (let ([visible (take (list-tail *file-tree-tree* *file-tree-window-start*)
+                       *file-tree-visible-height*)])
     (let loop ([items visible] [row 0])
       (unless (or (null? items) (>= row *file-tree-visible-height*))
         (define entry (car items))
@@ -700,6 +764,8 @@
   (cond
     [(equal? action 'down) (file-tree-cursor-down!) event-result/consume]
     [(equal? action 'up) (file-tree-cursor-up!) event-result/consume]
+    [(equal? action 'top) (file-tree-cursor-to-top!) event-result/consume]
+    [(equal? action 'bottom) (file-tree-cursor-to-bottom!) event-result/consume]
     [(equal? action 'create) (file-tree-prompt-create!) event-result/consume]
     [(equal? action 'rename) (file-tree-prompt-rename!) event-result/consume]
     [(equal? action 'delete) (file-tree-prompt-delete!) event-result/consume]
